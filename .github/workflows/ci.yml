@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: shellcheck
+        run: make lint
+
+  test-unit:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats + jq (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bats jq
+      - name: Install bats + jq (macOS)
+        if: runner.os == 'macOS'
+        run: brew install bats-core jq
+      - name: Run unit tests
+        run: make test-unit
+
+  test-integration:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats + jq + neovim (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bats jq neovim
+      - name: Install bats + jq + neovim (macOS)
+        if: runner.os == 'macOS'
+        run: brew install bats-core jq neovim
+      - name: Run integration tests
+        run: make test-int
+      - name: Run e2e tests
+        run: make test-e2e
