@@ -1,0 +1,562 @@
+#!/usr/bin/env bash
+# nvim-tmux shim entry point.
+#
+# Impersonates the tmux binary surface consumed by Claude Code. Each
+# subcommand handler parses its tmux flags, then delegates to the Lua
+# side (lua/nvim-tmux/) via one nvim RPC call. Session/pane state lives
+# in `vim.g.nvim_tmux` inside the target nvim.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(dirname "$SCRIPT_DIR")
+
+usage() {
+  cat >&2 <<'EOF'
+nvim-tmux: shim tmux for Claude Code.
+
+Usage: tmux <subcommand> [args...]
+
+Only the subcommands invoked by the claude binary are supported. This is
+not a general tmux replacement. If you need real tmux, install it from
+your package manager.
+EOF
+}
+
+# User-facing error. Exits after reporting.
+die() {
+  printf 'nvim-tmux: %s\n' "$*" >&2
+  exit 1
+}
+
+# Reads the version string from the repo's VERSION file.
+nvim_tmux_version() {
+  [[ -r "$REPO_ROOT/VERSION" ]] || { printf 'unknown\n'; return 0; }
+  tr -d '[:space:]' < "$REPO_ROOT/VERSION"   # strip trailing whitespace
+  printf '\n'
+}
+
+# --- nvim transport ----------------------------------------------------------
+
+# Resolves the nvim binary. NVIM_TMUX_NVIM_BIN overrides PATH lookup
+# (useful when PATH has a wrapper script in front of the real binary).
+_nvim_bin() {
+  printf '%s\n' "${NVIM_TMUX_NVIM_BIN:-nvim}"
+}
+
+# Returns the target nvim RPC socket. nvim auto-exports $NVIM in every
+# :terminal child it spawns; $NVIM_LISTEN_ADDRESS is the legacy fallback.
+nvim_socket() {
+  local sock="${NVIM:-${NVIM_LISTEN_ADDRESS:-}}"
+  if [[ -z "$sock" ]]; then
+    die "nvim: no \$NVIM socket -- launch claude from inside an nvim :terminal"
+  fi
+  printf '%s\n' "$sock"
+}
+
+# Evaluate a vim expression; trimmed vim-repr on stdout.
+#
+# `--headless` plus `</dev/null` forces non-interactive behavior: without
+# them, the nvim CLI writes terminal-capability probes (\x1b[?1049h ...)
+# to stdout when invoked under a pty (which we are, inside :terminal),
+# and those bytes corrupt $(nvim_expr ...) captures.
+nvim_expr() {
+  local expr="${1:?nvim_expr: expr required}"
+  "$(_nvim_bin)" --headless --server "$(nvim_socket)" \
+    --remote-expr "$expr" </dev/null
+}
+
+# --- Lua RPC -----------------------------------------------------------------
+
+# Build a vim-quoted string literal: doubles ' so the result is safe to
+# embed inside a single-quoted vim string.
+_lua_vimquote() {
+  local s="${1//\'/\'\'}"
+  printf "'%s'" "$s"
+}
+
+# Ensures the repo is on the live nvim's runtimepath so
+# `require('nvim-tmux')` works even when the user installed the shim
+# outside a plugin manager. Idempotent two ways:
+#   * _NT_RTP_DONE          (this bash process -- skip after first call)
+#   * g:nvim_tmux_rtp_added (the nvim instance -- skip the rtp+= itself)
+_lua_ensure_rtp() {
+  [[ -n "${_NT_RTP_DONE:-}" ]] && return 0
+  # The repo path rides in luaeval's _A argument, so it only needs plain
+  # vim-string quoting -- no fnameescape / nested-escape dance.
+  nvim_expr "luaeval('(function() if not vim.g.nvim_tmux_rtp_added then vim.opt.runtimepath:append(_A); vim.g.nvim_tmux_rtp_added = true end return true end)()', $(_lua_vimquote "$REPO_ROOT"))" >/dev/null
+  _NT_RTP_DONE=1
+}
+
+# Calls a method on the nvim-tmux Lua module with positional string
+# args. Echoes the raw vim repr of the return value on stdout. Lazily
+# injects rtp on first call -- subcommands that never touch nvim (-V,
+# set-option no-ops, etc.) never reach for it.
+_lua_call() {
+  _lua_ensure_rtp
+  local method="$1"; shift
+  local args=()
+  local a
+  for a in "$@"; do args+=("$(_lua_vimquote "$a")"); done
+  local IFS=,
+  # ${args[*]-}: bash 3.2 (macOS /bin/bash) treats an empty array as
+  # unset under `set -u`; the - default keeps zero-arg calls alive.
+  nvim_expr "v:lua.require'nvim-tmux'.${method}(${args[*]-})"
+}
+
+# --- State API -----------------------------------------------------------------
+#
+# Thin wrappers over `_lua_call` for the bookkeeping queries the cmd_*
+# handlers run directly (the pane-op handlers call _lua_call themselves).
+
+# Vim's remote-expr renders booleans as "v:true" / "v:false". Map both
+# styles to a bash exit code (0 = true, 1 = false). The explicit
+# `|| die` matters: callers invoke this inside `if` conditions, where
+# bash suspends `set -e` for the whole call chain -- without it, an RPC
+# failure (dead socket, lua error) would read as "false" instead of
+# erroring out.
+_state_call_bool() {
+  local r
+  r=$(_lua_call "$@") || die "nvim RPC failed (is the nvim behind \$NVIM still alive?)"
+  [[ "$r" == "v:true" || "$r" == "1" || "$r" == "true" ]]
+}
+
+# Hardcoded -- the leader pane id is a fixed constant, no point in
+# round-tripping through nvim for it. Lets tmux subcommands that only
+# need this value (display-message -p '#{pane_id}' without -t) work
+# without any nvim contact.
+state_leader_pane()       { printf '1:0.0\n'; }
+state_has_session()       { _state_call_bool has_session "$1"; }
+state_create_session()    { _lua_call create_session "$1" "${2:-}"; }
+state_create_window()     { _lua_call create_window "$1" "$2"; }
+state_count_panes()       { _lua_call count_panes "$1" "${2:-}"; }
+
+# list_* wrappers always emit a trailing newline so concatenations
+# (e.g. `for s in $sessions; do state_list_panes "$s"; done` in
+# `list-panes -a`) stay newline-separated. The Lua side returns a
+# pre-joined string with no trailer.
+_state_list() {
+  local out; out=$(_lua_call "$@")
+  [[ -n "$out" ]] && printf '%s\n' "$out"
+  return 0
+}
+state_list_sessions()     { _state_list list_sessions "${1:-name}"; }
+state_list_windows()      { _state_list list_windows "$1" "$2"; }
+state_list_panes()        { _state_list list_panes "$1" "${2:-}"; }
+
+# --- Shared argv helpers ---------------------------------------------------
+
+# arg <flag> <value> -- validates that a flag's argument is present and
+# echoes it. The subcommand name in the error is derived from the calling
+# cmd_* function. Runs inside $(...): die() kills the subshell and the
+# failed assignment aborts the script via set -e.
+arg() {
+  local cmd="${FUNCNAME[1]#cmd_}"
+  [[ -n "${2:-}" ]] || die "${cmd//_/-}: $1 requires an argument"
+  printf '%s\n' "$2"
+}
+
+# emit_format <pane_id> <format> -- shared -P/-F output for handlers that
+# return a fresh pane id.
+emit_format() {
+  local cmd="${FUNCNAME[1]#cmd_}"
+  case "$2" in
+    '#{pane_id}')   printf '%s\n' "$1" ;;
+    '#{window_id}') printf '%s\n' "${1%.*}" ;;
+    *) die "${cmd//_/-}: unsupported format: $2" ;;
+  esac
+}
+
+main() {
+  if (($# == 0)); then
+    usage
+    exit 1
+  fi
+
+  # Skip tmux global flags that appear before the subcommand. Claude
+  # uses -L <socket-name> to isolate its swarm session; the shim has no
+  # socket concept, so -L / -S / -f are silent no-ops. Boolean globals
+  # (-u, -2, -q, -v, -C, -N) are also accepted.
+  while (($#)); do
+    case "$1" in
+      -L|-S|-f)
+        [[ -n "${2:-}" ]] || die "global flag $1 requires an argument"
+        shift 2
+        ;;
+      -u|-2|-q|-v|-C|-N|-8)
+        shift
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  if (($# == 0)); then
+    usage
+    exit 1
+  fi
+
+  local sub="$1"
+  shift
+
+  case "$sub" in
+    # -V is Claude's pre-launch probe; it must work without a live nvim.
+    -V|--version)     printf 'tmux 3.0 (nvim-tmux v%s)\n' "$(nvim_tmux_version)" ;;
+    has-session)      cmd_has_session "$@" ;;
+    display-message)  cmd_display_message "$@" ;;
+    new-session)      cmd_new_session "$@" ;;
+    new-window)       cmd_new_window "$@" ;;
+    list-panes)       cmd_list_panes "$@" ;;
+    list-windows)     cmd_list_windows "$@" ;;
+    list-sessions|ls) cmd_list_sessions "$@" ;;
+    split-window)     cmd_split_window "$@" ;;
+    kill-pane)        cmd_kill_pane "$@" ;;
+    select-pane)      cmd_select_pane "$@" ;;
+    resize-pane)      cmd_resize_pane "$@" ;;
+    select-layout)    cmd_select_layout "$@" ;;
+    set-option)       cmd_set_option "$@" ;;
+    send-keys)        cmd_send_keys "$@" ;;
+    break-pane)       cmd_break_pane "$@" ;;
+    join-pane)        cmd_join_pane "$@" ;;
+    *)                die "unknown subcommand: ${sub}" ;;
+  esac
+}
+
+cmd_has_session() {
+  local target=""
+  while (($#)); do
+    case "$1" in
+      -t) target=$(arg -t "${2:-}"); shift 2 ;;
+      *)  die "has-session: unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "has-session: -t <session> is required"
+  if state_has_session "$target"; then
+    exit 0
+  else
+    exit 1
+  fi
+}
+
+cmd_display_message() {
+  local target="" format="" print=false
+  while (($#)); do
+    case "$1" in
+      -p) print=true; format=$(arg -p "${2:-}"); shift 2 ;;
+      -t) target=$(arg -t "${2:-}"); shift 2 ;;
+      *)  die "display-message: unknown flag: $1" ;;
+    esac
+  done
+  $print || die "display-message: -p <format> is required"
+  # If no target: return leader identity. If target: resolve it
+  # structurally. "S:W.P" -> pane_id=S:W.P, window_id=S:W. "S:W" ->
+  # window_id=S:W, pane_id is ambiguous so we error.
+  local pane_id window_id
+  if [[ -z "$target" ]]; then
+    pane_id=$(state_leader_pane)
+    window_id="${pane_id%.*}"
+  else
+    case "$target" in
+      *.*)
+        pane_id="$target"
+        window_id="${target%.*}"
+        ;;
+      *:*)
+        pane_id=""
+        window_id="$target"
+        ;;
+      *)
+        die "display-message: target must be S:W or S:W.P, got '$target'"
+        ;;
+    esac
+  fi
+  case "$format" in
+    '#{pane_id}')
+      [[ -n "$pane_id" ]] || die "display-message: target '$target' has no pane component"
+      printf '%s\n' "$pane_id"
+      ;;
+    '#{window_id}')
+      printf '%s\n' "$window_id"
+      ;;
+    '#{window_panes}')
+      # Count panes in the target window. Target shape Claude uses:
+      #   "<session-name>:<window-name>"      (external mode)
+      #   "<session-name>:<window-idx>"       (legacy / manual)
+      #   "<sess-idx>:<win-idx>"              (the shim's own pane-id form)
+      # Unknown session/window errors propagate from the Lua side.
+      state_count_panes "${window_id%%:*}" "${window_id#*:}"
+      ;;
+    *)
+      die "display-message: unsupported format: ${format}"
+      ;;
+  esac
+}
+
+cmd_new_session() {
+  local name="" window_name="" print=false format=""
+  while (($#)); do
+    case "$1" in
+      -d) shift ;;   # detached -- our sessions are always state-only
+      -s) name=$(arg -s "${2:-}"); shift 2 ;;
+      -n) window_name=$(arg -n "${2:-}"); shift 2 ;;
+      -P) print=true; shift ;;
+      -F) format=$(arg -F "${2:-}"); shift 2 ;;
+      *)  die "new-session: unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "new-session: -s <name> is required"
+  local pane_id
+  pane_id=$(state_create_session "$name" "${window_name:-default}")
+  if $print; then emit_format "$pane_id" "$format"; fi
+}
+
+cmd_new_window() {
+  local target="" window_name="" print=false format=""
+  while (($#)); do
+    case "$1" in
+      -t) target=$(arg -t "${2:-}"); shift 2 ;;
+      -n) window_name=$(arg -n "${2:-}"); shift 2 ;;
+      -P) print=true; shift ;;
+      -F) format=$(arg -F "${2:-}"); shift 2 ;;
+      *)  die "new-window: unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "new-window: -t <session> is required"
+  local pane_id
+  pane_id=$(state_create_window "$target" "${window_name:-default}")
+  if $print; then emit_format "$pane_id" "$format"; fi
+}
+
+cmd_list_panes() {
+  local target="" format="" all=false session_only=false
+  while (($#)); do
+    case "$1" in
+      -t) target=$(arg -t "${2:-}"); shift 2 ;;
+      -F) format=$(arg -F "${2:-}"); shift 2 ;;
+      -a) all=true; shift ;;            # all panes across all sessions
+      -s) session_only=true; shift ;;   # every pane in the target session
+      *)  die "list-panes: unknown flag: $1" ;;
+    esac
+  done
+  # Default format is #{pane_id} (what Claude asks for almost every time).
+  [[ -n "$format" ]] || format='#{pane_id}'
+  case "$format" in
+    '#{pane_id}') ;;
+    *) die "list-panes: unsupported format: ${format}" ;;
+  esac
+
+  if $all; then
+    # Enumerate every pane across every session. while-read instead of
+    # mapfile: macOS /bin/bash is 3.2, which has no mapfile.
+    local sess
+    while IFS= read -r sess; do
+      [[ -n "$sess" ]] && state_list_panes "$sess" ""
+    done < <(state_list_sessions name)
+    return 0
+  fi
+
+  [[ -n "$target" ]] || die "list-panes: -t <target> is required (or use -a for all sessions)"
+
+  # target is either "<session>" or "<session>:<window_idx>[.<pane_idx>]".
+  local session window_idx=""
+  if [[ "$target" == *:* ]]; then
+    session="${target%%:*}"
+    if ! $session_only; then
+      window_idx="${target#*:}"
+      window_idx="${window_idx%%.*}"
+    fi
+  else
+    session="$target"
+  fi
+
+  state_list_panes "$session" "$window_idx"
+}
+
+cmd_list_windows() {
+  local target="" format=""
+  while (($#)); do
+    case "$1" in
+      -t) target=$(arg -t "${2:-}"); shift 2 ;;
+      -F) format=$(arg -F "${2:-}"); shift 2 ;;
+      *)  die "list-windows: unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "list-windows: -t <session> is required"
+  [[ -n "$format" ]] || die "list-windows: -F <format> is required"
+  local field
+  case "$format" in
+    '#{window_name}') field="name" ;;
+    '#{window_id}')   field="id" ;;
+    *) die "list-windows: unsupported format: ${format}" ;;
+  esac
+  state_list_windows "$target" "$field"
+}
+
+cmd_split_window() {
+  local target="" direction="" size_pct="" print=false format=""
+  while (($#)); do
+    case "$1" in
+      -t) target=$(arg -t "${2:-}"); shift 2 ;;
+      -h) direction="h"; shift ;;
+      -v) direction="v"; shift ;;
+      -l) size_pct=$(arg -l "${2:-}"); size_pct="${size_pct%\%}"; shift 2 ;;
+      -P) print=true; shift ;;
+      -F) format=$(arg -F "${2:-}"); shift 2 ;;
+      *)  die "split-window: unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "split-window: -t <pane> is required"
+  [[ -n "$direction" ]] || die "split-window: -h or -v is required"
+
+  local new_pane_id
+  new_pane_id=$(_lua_call split_window "$target" "$direction" "$size_pct")
+  if $print; then emit_format "$new_pane_id" "$format"; fi
+}
+
+cmd_kill_pane() {
+  local target=""
+  while (($#)); do
+    case "$1" in
+      -t) target=$(arg -t "${2:-}"); shift 2 ;;
+      # tmux's -a kills all panes except the target. Not used by Claude
+      # (2.1.114 audit); error loudly so we see if it ever appears.
+      -a) die "kill-pane: -a not supported" ;;
+      *)  die "kill-pane: unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "kill-pane: -t <pane> is required"
+  _lua_call kill_pane "$target" >/dev/null
+}
+
+cmd_select_pane() {
+  local target="" title=""
+  while (($#)); do
+    case "$1" in
+      -t) target=$(arg -t "${2:-}"); shift 2 ;;
+      # -P pane style (e.g. "bg=red") is cosmetic -- validated, ignored.
+      -P) arg -P "${2:-}" >/dev/null; shift 2 ;;
+      -T) title=$(arg -T "${2:-}"); shift 2 ;;
+      *)  die "select-pane: unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "select-pane: -t <pane> is required"
+  _lua_call select_pane "$target" "$title" >/dev/null
+}
+
+cmd_resize_pane() {
+  local target="" width_pct=""
+  while (($#)); do
+    case "$1" in
+      -t) target=$(arg -t "${2:-}"); shift 2 ;;
+      -x) width_pct=$(arg -x "${2:-}"); width_pct="${width_pct%\%}"; shift 2 ;;
+      *)  die "resize-pane: unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "resize-pane: -t <pane> is required"
+  [[ -n "$width_pct" ]] || die "resize-pane: -x <size> is required"
+  _lua_call resize_pane "$target" "$width_pct" >/dev/null
+}
+
+# Every layout resolves to 'wincmd =' on the Lua side; Claude only
+# depends on the structural shape, not visual fidelity.
+cmd_select_layout() {
+  local layout=""
+  while (($#)); do
+    case "$1" in
+      -t) arg -t "${2:-}" >/dev/null; shift 2 ;;
+      *)  layout="$1"; shift ;;
+    esac
+  done
+  [[ -n "$layout" ]] || die "select-layout: layout name required (e.g. main-vertical, tiled)"
+  [[ "$layout" =~ ^(main-vertical|tiled|even-horizontal|even-vertical|main-horizontal)$ ]] \
+    || die "select-layout: unsupported layout: ${layout}"
+  _lua_call select_layout >/dev/null
+}
+
+# Documented no-op: Claude's set-option calls are cosmetic.
+cmd_set_option() { :; }
+
+cmd_send_keys() {
+  local target=""
+  local tokens=()
+  while (($#)); do
+    case "$1" in
+      -t) target=$(arg -t "${2:-}"); shift 2 ;;
+      -l) die "send-keys: -l (literal-mode) not supported in MVP" ;;
+      # -R (reset terminal) and -M (mouse) accepted silently; they
+      # don't gate Claude's flow.
+      -R|-M) shift ;;
+      *)
+        tokens+=("$1")
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "send-keys: -t <pane> is required"
+  ((${#tokens[@]} > 0)) || die "send-keys: at least one key token is required"
+  _lua_call send_keys "$target" "${tokens[@]}" >/dev/null
+}
+
+cmd_list_sessions() {
+  local format=""
+  while (($#)); do
+    case "$1" in
+      -F) format=$(arg -F "${2:-}"); shift 2 ;;
+      *)  die "list-sessions: unknown flag: $1" ;;
+    esac
+  done
+
+  # tmux's default output is "<name>: <N> windows ...". When Claude
+  # passes -F it expects ONLY that format value per line.
+  local field
+  if [[ -z "$format" ]]; then
+    field="name_with_count"
+  else
+    case "$format" in
+      '#{session_name}')    field="name" ;;
+      '#{session_id}')      field="id" ;;
+      *) die "list-sessions: unsupported format: ${format}" ;;
+    esac
+  fi
+  state_list_sessions "$field"
+}
+
+cmd_break_pane() {
+  # tmux break-pane -d -s <src> -t <dest-session>:
+  local src="" dest=""
+  while (($#)); do
+    case "$1" in
+      -d) shift ;;   # detached mode: don't switch focus
+      -s) src=$(arg -s "${2:-}"); shift 2 ;;
+      # Trailing colon (Claude's "session:" shape) indicates "anywhere
+      # in that session"; strip it.
+      -t) dest=$(arg -t "${2:-}"); dest="${dest%:}"; shift 2 ;;
+      *)  die "break-pane: unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$src"  ]] || die "break-pane: -s <src> is required"
+  [[ -n "$dest" ]] || die "break-pane: -t <dest-session> is required"
+  _lua_call break_pane "$src" "$dest" >/dev/null
+}
+
+cmd_join_pane() {
+  # tmux join-pane -h -s <hidden-pane> -t <target-window>
+  local src="" dest="" direction="h"
+  while (($#)); do
+    case "$1" in
+      -h) direction="h"; shift ;;
+      -v) direction="v"; shift ;;
+      -s) src=$(arg -s "${2:-}"); shift 2 ;;
+      -t) dest=$(arg -t "${2:-}"); shift 2 ;;
+      *)  die "join-pane: unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$src"  ]] || die "join-pane: -s <hidden-pane> is required"
+  [[ -n "$dest" ]] || die "join-pane: -t <target-window> is required"
+  # Real tmux join-pane is silent without -P (which Claude never passes).
+  _lua_call join_pane "$src" "$dest" "$direction" >/dev/null
+}
+
+# Dispatch only when executed; sourcing (tests) just loads the functions.
+[[ "${BASH_SOURCE[0]}" != "$0" ]] || main "$@"
