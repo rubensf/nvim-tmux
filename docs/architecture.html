@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>nvim-tmux — Architecture</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --ink:#e6edf3; --dim:#8b949e;
+    --bash:#7ee787; --bashbg:#12361f; --bashbd:#2ea043;
+    --rpc:#d2a8ff; --rpcbg:#2b1d3a; --rpcbd:#a371f7;
+    --lua:#79c0ff; --luabg:#10243e; --luabd:#388bfd;
+    --nvim:#ffa657; --nvimbg:#3a2410; --nvimbd:#db6d28;
+    --claude:#ff7b72; --claudebg:#3a1816; --claudebd:#f85149;
+    --line:#30363d;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    padding:32px 24px 80px;}
+  h1{font-size:26px;margin:0 0 4px}
+  h2{font-size:18px;margin:38px 0 14px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+  .sub{color:var(--dim);margin:0 0 8px}
+  code{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;font-size:.92em;
+    background:#22272e;padding:1px 5px;border-radius:4px;color:#e6edf3}
+  .wrap{max-width:1180px;margin:0 auto}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin:10px 0 0}
+  .legend span{display:inline-flex;align-items:center;gap:6px;color:var(--dim);font-size:12.5px}
+  .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
+
+  .stack{display:flex;flex-direction:column;gap:0}
+  .layer{border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:0;
+    background:var(--panel);position:relative}
+  .layer + .arrowrow{display:flex;justify-content:center;align-items:center;height:42px;color:var(--dim)}
+  .arrowrow .a{font-size:13px;background:var(--panel2);border:1px solid var(--line);
+    padding:3px 12px;border-radius:20px}
+  .ltitle{font-weight:700;font-size:13px;letter-spacing:.04em;text-transform:uppercase;
+    margin:0 0 12px;display:flex;align-items:center;gap:8px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
+  .card{border:1px solid var(--line);border-radius:9px;padding:12px 13px;background:var(--panel2)}
+  .card.bash{border-color:var(--bashbd);background:var(--bashbg)}
+  .card.rpc{border-color:var(--rpcbd);background:var(--rpcbg)}
+  .card.lua{border-color:var(--luabd);background:var(--luabg)}
+  .card.nvim{border-color:var(--nvimbd);background:var(--nvimbg)}
+  .card.claude{border-color:var(--claudebd);background:var(--claudebg)}
+  .card .fn{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-weight:700;font-size:13.5px;margin:0 0 3px}
+  .card .loc{float:right;font-size:11px;color:var(--dim);font-weight:400}
+  .card .desc{color:var(--dim);font-size:12.5px;margin:6px 0 0}
+  .card ul{margin:8px 0 0;padding-left:16px}
+  .card li{font-size:12px;color:var(--dim);margin:2px 0}
+  .card li b{color:var(--ink);font-weight:600;font-family:"SF Mono",monospace}
+
+  .b-bash{background:var(--bash)} .b-rpc{background:var(--rpc)}
+  .b-lua{background:var(--lua)} .b-nvim{background:var(--nvim)} .b-claude{background:var(--claude)}
+  .tag{font-size:11px;padding:1px 7px;border-radius:20px;font-weight:600;margin-left:auto}
+  .tag.bash{background:var(--bashbg);color:var(--bash);border:1px solid var(--bashbd)}
+  .tag.rpc{background:var(--rpcbg);color:var(--rpc);border:1px solid var(--rpcbd)}
+  .tag.lua{background:var(--luabg);color:var(--lua);border:1px solid var(--luabd)}
+  .tag.nvim{background:var(--nvimbg);color:var(--nvim);border:1px solid var(--nvimbd)}
+
+  table.seq{border-collapse:collapse;width:100%;margin-top:6px}
+  table.seq th,table.seq td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  table.seq th{background:var(--panel2);font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.03em}
+  table.seq td:first-child{width:34px;text-align:center;color:var(--dim);font-weight:700}
+  table.seq code{white-space:nowrap}
+  .who{font-weight:700;font-size:12px;padding:2px 8px;border-radius:5px;white-space:nowrap}
+  .who.bash{color:var(--bash);background:var(--bashbg)}
+  .who.lua{color:var(--lua);background:var(--luabg)}
+  .who.nvim{color:var(--nvim);background:var(--nvimbg)}
+
+  pre.state{background:#0a0c10;border:1px solid var(--line);border-radius:9px;padding:14px 16px;
+    overflow:auto;font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:12.5px;color:#c9d1d9;line-height:1.5}
+  .k{color:#79c0ff}.s{color:#a5d6ff}.n{color:#f0883e}.c{color:#8b949e;font-style:italic}
+
+  .note{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--rpcbd);
+    border-radius:7px;padding:12px 15px;margin-top:14px;color:var(--dim);font-size:13px}
+  .note b{color:var(--ink)}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:780px){.two{grid-template-columns:1fr}}
+  .pill{display:inline-block;font-size:11px;color:var(--dim);border:1px solid var(--line);
+    border-radius:20px;padding:1px 9px;margin-left:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>nvim-tmux <span class="pill">architecture</span></h1>
+  <p class="sub">A bash shim that impersonates the <code>tmux</code> CLI surface Claude Code's Agent Teams calls,
+  routing pane operations into real Neovim splits via the stock <code>nvim --remote-expr</code> RPC.
+  Three files, ~1230 LOC.</p>
+  <div class="legend">
+    <span><i class="dot b-claude"></i> Claude / caller</span>
+    <span><i class="dot b-bash"></i> Bash shim</span>
+    <span><i class="dot b-rpc"></i> RPC bridge</span>
+    <span><i class="dot b-lua"></i> Lua (inside nvim)</span>
+    <span><i class="dot b-nvim"></i> Neovim runtime</span>
+  </div>
+
+  <h2>The big picture — 5 layers, top to bottom</h2>
+  <div class="stack">
+
+    <!-- L1 caller -->
+    <div class="layer">
+      <div class="ltitle"><i class="dot b-claude"></i> 1 · Caller <span class="tag claude">external process</span></div>
+      <div class="cards">
+        <div class="card claude">
+          <div class="fn">claude (Agent Teams)</div>
+          <div class="desc">Runs inside an nvim <code>:terminal</code>. Believes it's talking to real tmux.
+          Probes <code>tmux -V</code>, then issues <code>new-session</code>, <code>split-window</code>,
+          <code>send-keys</code>, <code>break-pane</code>… to lay out its swarm.</div>
+        </div>
+        <div class="card claude">
+          <div class="fn">$NVIM env var</div>
+          <div class="desc">nvim auto-exports <code>$NVIM</code> (its RPC socket path) into every
+          <code>:terminal</code> child. That's the back-channel the shim talks to its parent nvim over.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrowrow"><span class="a">PATH resolves <code>tmux</code> → <code>bin/tmux</code> · argv ↓</span></div>
+
+    <!-- L2 bash -->
+    <div class="layer">
+      <div class="ltitle"><i class="dot b-bash"></i> 2 · Bash shim <span class="tag bash">bin/tmux · ~556 LOC, one file</span></div>
+      <div class="cards">
+        <div class="card bash">
+          <div class="fn">main() + cmd_* handlers</div>
+          <div class="desc">Strips tmux global flags (<code>-L/-S/-f</code>…), short-circuits <code>-V</code>,
+          routes the subcommand. Each of the 16 handlers parses its flags and makes <b>one</b> RPC.</div>
+          <ul>
+            <li><b>cmd_split_window</b>, <b>cmd_send_keys</b>, <b>cmd_kill_pane</b>,
+            <b>cmd_break_pane</b>, <b>cmd_join_pane</b>, …</li>
+            <li>Shared helpers: <b>arg</b> (flag validation), <b>emit_format</b> (-P/-F output),
+            <b>die</b></li>
+          </ul>
+        </div>
+        <div class="card bash">
+          <div class="fn">state_* query wrappers</div>
+          <div class="desc">Thin shims over <code>_lua_call</code> for the bookkeeping queries:
+          exit-code mapping for <code>v:true/v:false</code> (<code>state_has_session</code>) and
+          newline-termination for lists (<code>state_list_panes</code>).
+          <code>state_leader_pane</code> is a hardcoded constant — no nvim contact.</div>
+        </div>
+        <div class="card bash">
+          <div class="fn">transport + RPC</div>
+          <div class="desc">Bottom of the same file — see layer 3.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrowrow"><span class="a">spawns <code>nvim --headless --server $NVIM --remote-expr "…"</code> ↓</span></div>
+
+    <!-- L3 rpc -->
+    <div class="layer">
+      <div class="ltitle"><i class="dot b-rpc"></i> 3 · RPC bridge <span class="tag rpc">one call shape</span></div>
+      <div class="cards">
+        <div class="card rpc">
+          <div class="fn">nvim_expr</div>
+          <div class="desc">The single transport primitive: fork the nvim CLI against the parent's
+          socket, evaluate one vim expression, capture the result. <code>--headless</code> +
+          <code>&lt;/dev/null</code> keeps terminal escape probes out of captured stdout.</div>
+        </div>
+        <div class="card rpc">
+          <div class="fn">_lua_call METHOD args…</div>
+          <div class="desc">Quotes each arg as a vim string literal and evaluates
+          <code>v:lua.require'nvim-tmux'.METHOD(a,b,…)</code> via <code>nvim_expr</code>.
+          One RPC round-trip per tmux subcommand.</div>
+        </div>
+        <div class="card rpc">
+          <div class="fn">_lua_ensure_rtp</div>
+          <div class="desc">Lazily appends the repo to the live nvim's <code>runtimepath</code> on first
+          call (via <code>luaeval</code>, path riding in the <code>_A</code> argument), so
+          <code>require('nvim-tmux')</code> resolves even for non-plugin installs. Idempotent.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrowrow"><span class="a">executes synchronously inside the running nvim ↓</span></div>
+
+    <!-- L4 lua -->
+    <div class="layer">
+      <div class="ltitle"><i class="dot b-lua"></i> 4 · Lua module <span class="tag lua">lua/nvim-tmux/init.lua · ~662 LOC, one module</span></div>
+      <div class="cards">
+        <div class="card lua">
+          <div class="fn">§ state<span class="loc">flat maps</span></div>
+          <div class="desc">Single source of truth, in <code>vim.g.nvim_tmux</code>. Pure bookkeeping.</div>
+          <ul>
+            <li>Queries: <b>has_session</b>, <b>has_pane</b>, <b>get_nvim_field</b>, <b>list_panes</b>, <b>count_panes</b></li>
+            <li>Mutations: <b>create_session</b>, <b>split_pane</b>, <b>set_nvim_binding</b></li>
+            <li>kill/break/join bookkeeping = locals, called by the actions below</li>
+            <li>read → mutate local → <code>vim.g.nvim_tmux = t</code> (nested writes don't persist)</li>
+          </ul>
+        </div>
+        <div class="card lua">
+          <div class="fn">§ actions<span class="loc">tmux → nvim ops</span></div>
+          <div class="desc">One function per tmux subcommand; owns the window/buffer/job side.</div>
+          <ul>
+            <li><b>split_window</b> → win_gotoid + vsplit + bind</li>
+            <li><b>kill_pane</b> → nvim_buf_delete / win_close</li>
+            <li><b>open_terminal</b> → :terminal + TermClose autocmd</li>
+            <li><b>send_keys</b> → token grammar → chansend</li>
+            <li><b>break_pane</b>/<b>join_pane</b> → hide/restore, job kept alive</li>
+          </ul>
+        </div>
+        <div class="card lua">
+          <div class="fn">§ setup()<span class="loc">packaging</span></div>
+          <div class="desc">Prepends <code>bin/</code> to <code>vim.env.PATH</code> and sets
+          <code>NVIM_TMUX_NVIM_BIN = vim.v.progpath</code> so <code>:terminal</code> children find the shim.
+          Auto-run by <code>plugin/nvim-tmux.lua</code> (14-line stub) unless
+          <code>vim.g.nvim_tmux_disable</code>.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrowrow"><span class="a">vim.fn / vim.api / vim.cmd ↓</span></div>
+
+    <!-- L5 nvim -->
+    <div class="layer">
+      <div class="ltitle"><i class="dot b-nvim"></i> 5 · Neovim runtime <span class="tag nvim">the actual editor</span></div>
+      <div class="cards">
+        <div class="card nvim">
+          <div class="fn">windows / buffers / terminal jobs</div>
+          <div class="desc">Real splits the user sees. <code>vsplit</code>, <code>win_gotoid</code>,
+          <code>:terminal</code>, <code>chansend</code>, <code>nvim_buf_delete</code> — each teammate is a
+          terminal buffer in its own window.</div>
+        </div>
+        <div class="card nvim">
+          <div class="fn">vim.g.nvim_tmux</div>
+          <div class="desc">The state dict lives here — scoped to this nvim instance, atomic per RPC call
+          (single-threaded event loop), gone on quit. No disk, no jq, no lockfiles.</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="note">
+    <b>Why this shape?</b> Each <code>tmux</code> invocation is a fresh short-lived process, so state must
+    live somewhere persistent: the long-lived nvim process itself. Once state lives in nvim, the code that
+    mutates it wants to live there too — bash shrinks to what it's good at (being the tmux-shaped argv parser
+    at the process boundary), and the single event loop gives atomicity, per-instance scoping, and lifecycle
+    cleanup for free.
+  </div>
+
+  <h2>Data flow — one example: <code>tmux split-window -t 2:0.0 -h -P -F '#{pane_id}'</code></h2>
+  <table class="seq">
+    <tr><th>#</th><th>Where</th><th>What happens</th></tr>
+    <tr><td>1</td><td><span class="who bash">bin/tmux</span></td>
+      <td><code>main()</code> strips globals, routes to <code>cmd_split_window</code>,
+      which parses <code>-t 2:0.0 -h -P -F '#{pane_id}'</code> via the <code>arg</code> helper.</td></tr>
+    <tr><td>2</td><td><span class="who bash">bin/tmux</span></td>
+      <td><code>_lua_call split_window "2:0.0" "h" ""</code> → (first call only) <code>_lua_ensure_rtp</code> →
+      <code>nvim_expr "v:lua.require'nvim-tmux'.split_window('2:0.0','h','')"</code> forks the nvim CLI
+      against <code>$NVIM</code>.</td></tr>
+    <tr><td>3</td><td><span class="who lua">init.lua § actions</span></td>
+      <td><code>split_window</code> resolves the parent's winid (state lookup, leader fallback),
+      <code>vim.fn.win_gotoid()</code>, <code>vim.cmd('vsplit')</code>, grabs the new <code>win_getid()</code>.</td></tr>
+    <tr><td>4</td><td><span class="who lua">init.lua § state</span></td>
+      <td><code>split_pane('2:0.0')</code> bumps <code>windows["2:0"].next_pane</code> and creates
+      <code>panes["2:0.1"]</code>; <code>set_nvim_binding('2:0.1', winid)</code> records the window id.
+      All inside one event-loop turn — atomic.</td></tr>
+    <tr><td>5</td><td><span class="who nvim">nvim</span></td>
+      <td>The split is visible; the expression result <code>"2:0.1"</code> returns over the socket.</td></tr>
+    <tr><td>6</td><td><span class="who bash">bin/tmux</span></td>
+      <td><code>cmd_split_window</code> captures <code>2:0.1</code> and, because <code>-P -F</code>,
+      <code>emit_format</code> prints <code>2:0.1</code> — exactly what Claude expects from real tmux.</td></tr>
+  </table>
+
+  <h2>State shape — <code>vim.g.nvim_tmux</code> (flat: ids are the keys)</h2>
+  <div class="two">
+    <pre class="state">{
+  <span class="k">next_session_idx</span>: <span class="n">3</span>,
+  <span class="k">leader_winid</span>: <span class="n">1000</span>,    <span class="c">-- cached on first op</span>
+  <span class="k">sessions</span>: {
+    <span class="s">"swarm"</span>: { idx: <span class="n">2</span>, next_window: <span class="n">1</span> }
+  },
+  <span class="k">windows</span>: {
+    <span class="s">"2:0"</span>: { name: <span class="s">"leader"</span>, next_pane: <span class="n">2</span> }
+  },
+  <span class="k">panes</span>: {
+    <span class="s">"2:0.0"</span>: { nvim_winid: <span class="n">1000</span>, … },
+    <span class="s">"2:0.1"</span>: {
+      nvim_winid:   <span class="n">1003</span>,  <span class="c">-- which split</span>
+      nvim_bufnr:   <span class="n">4</span>,     <span class="c">-- which buffer</span>
+      nvim_chan_id: <span class="n">2</span>,     <span class="c">-- chansend target</span>
+      hidden: <span class="n">false</span>,
+      hidden_session: <span class="n">null</span>
+    }
+  }
+}</pre>
+    <div>
+      <div class="card lua" style="margin-bottom:12px">
+        <div class="fn">Ids encode the hierarchy</div>
+        <div class="desc"><code>S:W.P</code> — session-idx : window-idx . pane-idx, e.g.
+        <code>2:0.1</code>. Since the id already says where a pane lives, the store is flat:
+        lookups are <code>panes[pid]</code>, listings are prefix scans. The leader is always
+        <code>1:0.0</code> (hardcoded constant). Indices are monotonic — never reused.</div>
+      </div>
+      <div class="card lua" style="margin-bottom:12px">
+        <div class="fn">break-pane / join-pane</div>
+        <div class="desc">Hiding is <b>in place</b>: <code>break-pane</code> sets
+        <code>hidden=true</code> and closes the window — <b>the buffer + terminal job stay alive</b>,
+        and the record stays under its id (so it keeps resolving) while
+        <code>list-panes</code>/<code>count_panes</code> skip it. <code>join-pane</code> re-splits,
+        loads the preserved buffer, and moves the record to its new id.</div>
+      </div>
+      <div class="card rpc">
+        <div class="fn">Atomicity</div>
+        <div class="desc">Each <code>_lua_call</code> runs an entire operation to completion inside
+        nvim's single-threaded event loop. Concurrent shim invocations can't interleave — no locks,
+        no tmp+mv, no state files.</div>
+      </div>
+    </div>
+  </div>
+
+  <h2>How it gets onto your <code>PATH</code></h2>
+  <div class="cards">
+    <div class="card lua">
+      <div class="fn">As an nvim plugin</div>
+      <div class="desc"><code>plugin/nvim-tmux.lua</code> auto-runs <code>setup()</code> on startup →
+      prepends <code>bin/</code> to <code>vim.env.PATH</code> → every <code>:terminal</code> child (incl. Claude)
+      resolves <code>tmux</code> to the shim. Zero system changes — your login shell never sees it.</div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

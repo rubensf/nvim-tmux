@@ -83,7 +83,7 @@ If any of these are wrong, jump to the "First step for any reported issue" secti
 
 ## Key files to read first
 
-- `docs/CONTRACTS.md` — interface contracts (send-keys grammar, transport, stderr/exit conventions). CAUTION: its §1–2 still describe the retired `state.json` design — trust the code (`lua/nvim-tmux/init.lua`) over the doc for state schema until it's rewritten.
+- `docs/CONTRACTS.md` — authoritative interface contracts: state schema (§1), bash⇄lua RPC surface (§2), nvim-side op semantics (§3), send-keys grammar (§4), stderr/exit conventions (§5).
 - `bin/tmux` — the whole bash side: argv parsing + subcommand routing + `nvim_expr` transport + `_lua_call` dispatcher + `state_*` wrappers. Start here to trace which handler a failing invocation ran.
 - `lua/nvim-tmux/init.lua` — the whole Lua side: state bookkeeping (source of truth for "which pane has which winid"), the pane/terminal actions, send-keys grammar, and setup().
 
@@ -162,7 +162,7 @@ State holds a stale `nvim_winid`. The leader pane's winid is cached on first use
 Shim was invoked outside any `:terminal`, so nvim never exported `$NVIM` into the shell. Unsupported by design — tell the user to launch whatever ran the shim from inside `:terminal` in a live nvim.
 
 ### `send-keys: unsupported key literal '<Tab>' / '<BSpace>' / ...`
-`docs/CONTRACTS.md §5` lists the supported key names: `Enter`, `Space`, `C-c`, `C-d`. Anything else that matches the tmux key-literal shape (`^[A-Z][-A-Za-z0-9]+$`) is rejected rather than typed literally. If Claude needs a new one, add a case to `translate_token` in `lua/nvim-tmux/init.lua` and update CONTRACTS §5.
+`docs/CONTRACTS.md §4` lists the supported key names: `Enter`, `Space`, `C-c`, `C-d`. Anything else that matches the tmux key-literal shape (`^[A-Z][-A-Za-z0-9]+$`) is rejected rather than typed literally. If Claude needs a new one, add a case to `translate_token` in `lua/nvim-tmux/init.lua` and update CONTRACTS §4.
 
 ### Claude says "Failed to create swarm session"
 First error after that is usually the real one — ask for the full stderr. Often: a tmux global flag the dispatcher doesn't strip (e.g. `tmux -L claude-swarm new-session ...`), or an option in `new-session` we never audited.
@@ -184,7 +184,7 @@ Never add a subcommand without tracing it back to Claude's binary. Silent pass-t
   handlers parse flags in `bin/tmux` and delegate to a Lua method.
 - Don't introduce new runtime dependencies beyond `bash`, `nvim`, POSIX coreutils.
   No Node, no Python (that's why `nvr` was rejected). `jq` is test-only.
-- Don't silently swallow unknown subcommands/flags — CONTRACTS §6 says fail loudly.
+- Don't silently swallow unknown subcommands/flags — CONTRACTS §5 says fail loudly. (`set-option` is the one documented exception: a cosmetic no-op that accepts anything.)
 - Don't reuse session/window/pane indices; they're monotonic per run.
 - Don't mutate `vim.g.nvim_tmux` with nested writes (`vim.g.nvim_tmux.x = y`
   doesn't persist) — read into a local, mutate, commit the whole table back.
