@@ -221,6 +221,15 @@ local function state_kill_pane(pid)
   return "killed"
 end
 
+-- Current pane id owning nvim buffer `bufnr`, or nil. Reverse lookup
+-- on demand: records move between ids (join_pane), so a captured pid
+-- can go stale while the bufnr stays put.
+local function pid_for_bufnr(bufnr)
+  for pid, pane in pairs(_read().panes or {}) do
+    if pane.nvim_bufnr == bufnr then return pid end
+  end
+end
+
 -- Hides a pane IN PLACE: the record stays under its origin id with
 -- hidden=true, so the id keeps resolving (get_nvim_field etc.) while
 -- list_panes/count_panes skip it. No cross-key move.
@@ -546,6 +555,35 @@ local function translate_token(tok)
   return tok
 end
 
+-- When a pane terminal's process exits naturally (`exit`, C-d, agent
+-- done), collapse the window and drop the pane record -- otherwise
+-- list_panes keeps advertising a dead channel. One GLOBAL autocmd per
+-- nvim instance, not buffer-local: nvim's default TermClose handler
+-- deletes clean-exit shell buffers, and that deletion would remove a
+-- buffer-local autocmd before it ever ran. The delete is deferred so
+-- it runs AFTER TermClose finishes -- a synchronous delete from inside
+-- TermClose trips E937 "buffer in use".
+local termclose_installed = false
+local function ensure_termclose_autocmd()
+  if termclose_installed then return end
+  termclose_installed = true
+  vim.api.nvim_create_autocmd("TermClose", {
+    nested = true,
+    callback = function(args)
+      local bufnr = args.buf
+      if not pid_for_bufnr(bufnr) then return end -- not a shim pane
+      vim.defer_fn(function()
+        pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+        -- Re-resolve the owner: join_pane may have moved the record
+        -- to a new id between TermClose and this deferred call; noop
+        -- when kill_pane already removed it.
+        local owner = pid_for_bufnr(bufnr)
+        if owner then state_kill_pane(owner) end
+      end, 0)
+    end,
+  })
+end
+
 function M.open_terminal(pid)
   local existing = M.get_nvim_field(pid, "nvim_chan_id")
   if existing ~= "null" then return tonumber(existing) end
@@ -576,19 +614,7 @@ function M.open_terminal(pid)
     error("send-keys: failed to spawn :terminal for pane '" .. pid .. "'")
   end
 
-  -- When the inner process exits naturally (`exit`, C-d, agent done),
-  -- collapse the window. The delete is deferred via timer_start(0)
-  -- so it runs AFTER TermClose finishes -- a synchronous delete from
-  -- inside TermClose trips E937 "buffer in use".
-  vim.api.nvim_create_autocmd("TermClose", {
-    buffer = bufnr, once = true, nested = true,
-    callback = function()
-      vim.defer_fn(function()
-        pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
-      end, 0)
-    end,
-  })
-
+  ensure_termclose_autocmd()
   M.set_nvim_binding(pid, winid, bufnr, chan)
   return chan
 end
