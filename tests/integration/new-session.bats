@@ -72,6 +72,16 @@ teardown() { nt_int_teardown; }
   [[ "$output" == *"session already exists"* ]]
 }
 
+@test "lua errors keep the documented prefix and exit code" {
+  # CONTRACTS.md: user-facing errors are `nvim-tmux: <msg>` on stderr,
+  # exit code 1 -- including failures raised inside the Lua module.
+  "$SHIM" new-session -d -s foo
+  run "$SHIM" new-session -d -s foo
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"nvim-tmux: "* ]]
+  [[ "$output" != *"Error executing lua"* ]]
+}
+
 @test "new-session without -s errors" {
   run "$SHIM" new-session -d
   [ "$status" -ne 0 ]
