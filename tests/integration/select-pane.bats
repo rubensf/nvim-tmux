@@ -38,6 +38,25 @@ current_winid() { remote_expr "win_getid()"; }
   [ "$output" = "teammate-foo" ]
 }
 
+@test "select-pane -T before materialization defers the title to open_terminal" {
+  # Pane 2:0.0 has no bound window yet; the title must not land on the
+  # leader-fallback window, and must apply once the pane materializes.
+  local leader_winid
+  leader_winid=$(state_dump | jq -r '.leader_winid')
+  "$SHIM" select-pane -t "2:0.0" -T "teammate-title"
+  run remote_expr "getwinvar(${leader_winid}, '&winbar')"
+  [ "$output" = "" ]
+
+  "$SHIM" send-keys -t "2:0.0" 'echo' Space 'hi' Enter
+  local winid
+  winid=$(state_dump | jq -r '.panes["2:0.0"].nvim_winid')
+  run remote_expr "getwinvar(${winid}, '&winbar')"
+  [ "$output" = "teammate-title" ]
+  # One-shot: consumed on application.
+  run bash -c "state_dump | jq '.panes[\"2:0.0\"] | has(\"pending_title\")'"
+  [ "$output" = "false" ]
+}
+
 @test "select-pane -P style is accepted and ignored" {
   run "$SHIM" select-pane -t "2:0.0" -P 'bg=red'
   [ "$status" -eq 0 ]

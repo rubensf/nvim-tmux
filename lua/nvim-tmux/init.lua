@@ -20,7 +20,7 @@
 --   sessions  name    -> { idx, next_window }
 --   windows   "S:W"   -> { name, next_pane }
 --   panes     "S:W.P" -> { nvim_winid, nvim_bufnr, nvim_chan_id,
---                          hidden, hidden_session }
+--                          hidden, hidden_session, pending_title }
 --
 -- Every mutation reads `vim.g.nvim_tmux` into a local table, mutates
 -- that, then writes the local back to `vim.g`. Direct nested mutation
@@ -450,13 +450,24 @@ end
 
 function M.select_pane(pid, title)
   if not M.has_pane(pid) then error("select-pane: unknown pane '" .. pid .. "'") end
+  local bound = pid == LEADER_PANE
+    or M.get_nvim_field(pid, "nvim_winid") ~= "null"
   local winid = winid_for_pane(pid)
   if vim.fn.win_id2win(winid) == 0 then
     error("select-pane: nvim window " .. winid .. " for pane " .. pid .. " no longer exists")
   end
   vim.fn.win_gotoid(winid)
   if title and title ~= "" then
-    pcall(vim.api.nvim_set_option_value, "winbar", title, { win = winid })
+    if bound then
+      pcall(vim.api.nvim_set_option_value, "winbar", title, { win = winid })
+    else
+      -- Unmaterialized pane: winid above is the leader fallback, and
+      -- titling it would mislabel the leader window. Stash the title;
+      -- open_terminal applies it on materialization.
+      local s = _read()
+      s.panes[pid].pending_title = title
+      _commit(s)
+    end
   end
   return pid
 end
@@ -616,6 +627,15 @@ function M.open_terminal(pid)
 
   ensure_termclose_autocmd()
   M.set_nvim_binding(pid, winid, bufnr, chan)
+
+  -- Apply a title stashed by select_pane before materialization.
+  local pending = M.get_nvim_field(pid, "pending_title")
+  if pending ~= "null" then
+    pcall(vim.api.nvim_set_option_value, "winbar", pending, { win = winid })
+    local s = _read()
+    s.panes[pid].pending_title = nil
+    _commit(s)
+  end
   return chan
 end
 
