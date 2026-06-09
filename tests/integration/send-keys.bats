@@ -53,6 +53,32 @@ teardown() { nt_int_teardown; }
   [[ "$output" == *"unsupported key literal"* ]]
 }
 
+@test "send-keys with a bad literal does not leave a terminal behind" {
+  local wins_before
+  wins_before=$(remote_expr "winnr('\$')")
+  run "$SHIM" send-keys -t "2:0.1" Tab
+  [ "$status" -ne 0 ]
+  # No channel recorded, no extra window materialized.
+  run bash -c "state_dump | jq -r '.panes[\"2:0.1\"].nvim_chan_id'"
+  [ "$output" = "null" ]
+  [ "$(remote_expr "winnr('\$')")" = "$wins_before" ]
+}
+
+@test "natural terminal exit removes the pane from state" {
+  "$SHIM" send-keys -t "2:0.1" 'exit' Enter
+  # TermClose cleanup is deferred onto nvim's event loop; poll for it.
+  local waited=0
+  while state_dump | jq -e '.panes["2:0.1"]' >/dev/null 2>&1; do
+    ((waited >= 5000)) && break
+    sleep 0.1
+    waited=$((waited + 100))
+  done
+  run bash -c "state_dump | jq '.panes | has(\"2:0.1\")'"
+  [ "$output" = "false" ]
+  run "$SHIM" list-panes -t "swarm:0" -F '#{pane_id}'
+  [[ "$output" != *"2:0.1"* ]]
+}
+
 @test "send-keys -l (literal mode) errors" {
   run "$SHIM" send-keys -t "2:0.1" -l 'x'
   [ "$status" -ne 0 ]

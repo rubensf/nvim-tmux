@@ -31,17 +31,28 @@ nt_int_setup() {
 
   TEST_TMP=$(mktemp -d -t nt-int.XXXXXX)
   SOCK="$TEST_TMP/nvim.sock"
-  "$NVIM_BIN" --headless --listen "$SOCK" --clean >/dev/null 2>&1 &
+  NVIM_LOG="$TEST_TMP/nvim-startup.log"
+  "$NVIM_BIN" --headless --listen "$SOCK" --clean >/dev/null 2>"$NVIM_LOG" &
   NVIM_PID=$!
   export NVIM="$SOCK"
   export NVIM_BIN SOCK
   unset NVIM_LISTEN_ADDRESS
 
+  # An nvim we FOUND but that cannot start --listen is a hard failure,
+  # not a skip -- skipping here masked real breakage (sandbox denials,
+  # crashing binary) as a green suite. Only a missing binary skips.
   local waited=0
   while [[ ! -S "$SOCK" ]]; do
+    if ! kill -0 "$NVIM_PID" 2>/dev/null; then
+      echo "nvim exited before creating its socket; startup stderr:" >&2
+      cat "$NVIM_LOG" >&2
+      return 1
+    fi
     ((waited >= 3000)) && {
       kill "$NVIM_PID" 2>/dev/null || true
-      skip "nvim socket did not appear in 3s"
+      echo "nvim socket did not appear in 3s; startup stderr:" >&2
+      cat "$NVIM_LOG" >&2
+      return 1
     }
     sleep 0.05
     waited=$((waited + 50))
