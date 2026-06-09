@@ -595,6 +595,11 @@ end
 
 function M.send_keys(pid, ...)
   if not M.has_pane(pid) then error("send-keys: unknown pane '" .. pid .. "'") end
+  -- Translate (and thereby validate) every token BEFORE touching nvim
+  -- state: a bad literal must not leave a freshly opened terminal behind.
+  local n = select("#", ...)
+  local parts = {}
+  for i = 1, n do parts[i] = translate_token(select(i, ...)) end
   local chan_str = M.get_nvim_field(pid, "nvim_chan_id")
   local chan
   if chan_str == "null" then
@@ -602,9 +607,6 @@ function M.send_keys(pid, ...)
   else
     chan = tonumber(chan_str)
   end
-  local n = select("#", ...)
-  local parts = {}
-  for i = 1, n do parts[i] = translate_token(select(i, ...)) end
   vim.api.nvim_chan_send(chan, table.concat(parts))
   return ""
 end
